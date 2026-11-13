@@ -1,0 +1,31 @@
+# STM32CubeIDE build output
+firmware/**/Debug/
+firmware/**/Release/
+*.o
+*.d
+*.su
+*.elf
+*.map
+*.list
+
+# Yocto build directories (huge, never commit)
+build/
+downloads/
+sstate-cache/
+tmp/
+poky/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Data and databases
+*.db
+ml/data/raw/
+
+# Editors
+.vscode/
+.idea/
