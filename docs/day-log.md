@@ -1,4 +1,8 @@
-# Day log
+## Day 3
+- Built the first Yocto image (poky scarthgap 5.0.21, core-image-minimal, qemux86-64).
+- Booted it in QEMU and logged in as root. Root filesystem: 31 MB.
+- Lessons: Ubuntu 24.04 user-namespace fix, rm_work to save disk, limit threads to avoid freezing the VM,
+  VirtualBox NAT + virtio-net for full network speed, download first with --runall=fetch.# Day log
 
 One short entry per day: what I did, what I learned, what blocked me.
 
