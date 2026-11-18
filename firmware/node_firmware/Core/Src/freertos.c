@@ -27,6 +27,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include "spi.h"
+#include "can.h"
 #include <math.h>
 #include <stdlib.h>
 
@@ -61,6 +62,19 @@ typedef struct {
 #define VIB_WINDOW   100      /* 100 samples x 10 ms = 1 s window */
 #define RAW_PER_G    16384    /* +-2 g range: 16384 raw units = 1 g */
 
+/* CAN protocol (docs/PROTOCOL.md): ID = 0x100 * NODE_ID + message type */
+#define NODE_ID          1
+#define CAN_MSG_VIB      0x01
+#define CAN_MSG_TEMP     0x02
+#define CAN_MSG_HB       0x03
+#define CAN_ID(type)     (0x100 * NODE_ID + (type))
+
+/* Error flags sent in the heartbeat (byte 1) */
+#define ERR_IMU          0x01
+#define ERR_TEMP         0x02
+#define ERR_QUEUE_FULL   0x04
+#define ERR_CAN_TX       0x08
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -74,6 +88,7 @@ osMessageQueueId_t accelQueueHandle;
 osMessageQueueId_t featureQueueHandle;
 osMutexId_t        tempMutexHandle;
 TempData_t         g_temp = { 0.0f, 1 };   /* "not found" until the first reading */
+volatile uint8_t   g_err_flags = 0;        /* ERR_xxx bits, sent in the heartbeat */
 
 /* USER CODE END Variables */
 /* Definitions for LedTask */
@@ -110,6 +125,13 @@ const osThreadAttr_t TempTask_attributes = {
   .name = "TempTask",
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityBelowNormal,
+};
+/* Definitions for CanTask */
+osThreadId_t CanTaskHandle;
+const osThreadAttr_t CanTask_attributes = {
+  .name = "CanTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
 };
 
 /* Private function prototypes -----------------------------------------------*/
@@ -243,6 +265,73 @@ static uint8_t ds18b20_read(float *temp_c)
   return 0;
 }
 
+/* ---------- error flags (shared by several tasks) ---------- */
+static void set_err(uint8_t flag)
+{
+  taskENTER_CRITICAL();          /* read-modify-write must not be interrupted */
+  g_err_flags |= flag;
+  taskEXIT_CRITICAL();
+}
+
+static void clear_err(uint8_t flag)
+{
+  taskENTER_CRITICAL();
+  g_err_flags &= (uint8_t)~flag;
+  taskEXIT_CRITICAL();
+}
+
+/* ---------- CAN ---------- */
+/* Accept every standard frame into RX FIFO 0, then start CAN1 */
+/* Accept every standard frame into RX FIFO 0, then start CAN1 */
+static void can_start(void)
+{
+  CAN_FilterTypeDef f = {0};
+  f.FilterBank           = 0;
+  f.FilterMode           = CAN_FILTERMODE_IDMASK;
+  f.FilterScale          = CAN_FILTERSCALE_32BIT;
+  f.FilterIdHigh         = 0x0000;
+  f.FilterIdLow          = 0x0000;
+  f.FilterMaskIdHigh     = 0x0000;   /* mask 0 = accept all IDs */
+  f.FilterMaskIdLow      = 0x0000;
+  f.FilterFIFOAssignment = CAN_RX_FIFO0;
+  f.FilterActivation     = ENABLE;
+  f.SlaveStartFilterBank = 14;
+
+  HAL_StatusTypeDef st1 = HAL_CAN_ConfigFilter(&hcan1, &f);
+  HAL_StatusTypeDef st2 = HAL_CAN_Start(&hcan1);
+  printf("CAN filter=%d start=%d mode=%s err=0x%08lX state=%d MSR=0x%08lX BTR=0x%08lX\r\n",
+         st1, st2,
+         hcan1.Init.Mode == CAN_MODE_SILENT_LOOPBACK ? "silent-loopback" : "NOT loopback",
+         hcan1.ErrorCode, hcan1.State, CAN1->MSR, CAN1->BTR);
+}
+
+/* Send one standard frame; waits up to 10 ms for a free mailbox */
+static void can_send(uint16_t id, const uint8_t *data, uint8_t len)
+{
+  CAN_TxHeaderTypeDef h = {0};
+  uint32_t mailbox;
+  h.StdId = id;
+  h.IDE   = CAN_ID_STD;
+  h.RTR   = CAN_RTR_DATA;
+  h.DLC   = len;
+
+  uint32_t t0 = osKernelGetTickCount();
+  while (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0)
+  {
+    if (osKernelGetTickCount() - t0 > 10) { set_err(ERR_CAN_TX); return; }
+    osDelay(1);
+  }
+  if (HAL_CAN_AddTxMessage(&hcan1, &h, (uint8_t *)data, &mailbox) != HAL_OK)
+    set_err(ERR_CAN_TX);
+}
+
+/* Little-endian helpers, as in PROTOCOL.md */
+static void put_u16(uint8_t *p, uint16_t v) { p[0] = v & 0xFF; p[1] = v >> 8; }
+static void put_u32(uint8_t *p, uint32_t v)
+{
+  p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF; p[2] = (v >> 16) & 0xFF; p[3] = v >> 24;
+}
+
 /* USER CODE END FunctionPrototypes */
 
 void StartLedTask(void *argument);
@@ -250,6 +339,7 @@ void StartUartTask(void *argument);
 void StartSensorTask(void *argument);
 void StartProcessTask(void *argument);
 void StartTempTask(void *argument);
+void StartCanTask(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -279,7 +369,7 @@ void MX_FREERTOS_Init(void) {
   /* add queues, ... */
   /* Queue of 32 raw samples: SensorTask -> ProcessTask */
   accelQueueHandle = osMessageQueueNew(32, sizeof(AccelSample_t), NULL);
-  /* Queue of 8 vibration results: ProcessTask -> UartTask */
+  /* Queue of 8 vibration results: ProcessTask -> CanTask */
   featureQueueHandle = osMessageQueueNew(8, sizeof(VibFeature_t), NULL);
   /* USER CODE END RTOS_QUEUES */
 
@@ -298,6 +388,9 @@ void MX_FREERTOS_Init(void) {
 
   /* creation of TempTask */
   TempTaskHandle = osThreadNew(StartTempTask, NULL, &TempTask_attributes);
+
+  /* creation of CanTask */
+  CanTaskHandle = osThreadNew(StartCanTask, NULL, &CanTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -328,36 +421,43 @@ void StartLedTask(void *argument)
 }
 
 /* USER CODE BEGIN Header_StartUartTask */
-/* Prints one line per second: vibration features + latest temperature */
+/* CAN monitor: prints every frame received on CAN1 (SLCAN format + decoded) */
 /* USER CODE END Header_StartUartTask */
 void StartUartTask(void *argument)
 {
   /* USER CODE BEGIN StartUartTask */
   setvbuf(stdout, NULL, _IONBF, 0);
-  printf("\r\n=== node_firmware started ===\r\n");
+  printf("\r\n=== node_firmware started (node %d) ===\r\n", NODE_ID);
 
-  VibFeature_t f;
+  CAN_RxHeaderTypeDef h;
+  uint8_t d[8];
   for(;;)
   {
-    /* wait for the next 1-second vibration result */
-    if (osMessageQueueGet(featureQueueHandle, &f, NULL, osWaitForever) == osOK)
+    while (HAL_CAN_GetRxFifoFillLevel(&hcan1, CAN_RX_FIFO0) > 0)
     {
-      TempData_t t;
-      osMutexAcquire(tempMutexHandle, osWaitForever);
-      t = g_temp;                                  /* copy under the mutex */
-      osMutexRelease(tempMutexHandle);
+      if (HAL_CAN_GetRxMessage(&hcan1, CAN_RX_FIFO0, &h, d) != HAL_OK) break;
 
-      printf("t=%lu ms  vib RMS=%u mg  peak=%u mg  ", f.tick, f.rms_mg, f.peak_mg);
-      if (t.status == 0)
+      /* 1) SLCAN text line, e.g. "t1015 2C01A0030A" (what a USB-CAN adapter sends to Linux) */
+      printf("t%03lX%lu", h.StdId, h.DLC);
+      for (uint32_t i = 0; i < h.DLC; i++) printf("%02X", d[i]);
+
+      /* 2) human-readable decoding, same rules as gateway/protocol.py */
+      uint8_t type = h.StdId & 0xFF;
+      if (type == CAN_MSG_VIB && h.DLC >= 5)
+        printf("   -> vibration RMS=%u mg peak=%u mg counter=%u\r\n",
+               d[0] | (d[1] << 8), d[2] | (d[3] << 8), d[4]);
+      else if (type == CAN_MSG_TEMP && h.DLC >= 3)
       {
-        int t100 = (int)(t.temp_c * 100.0f);       /* printf has no float support here */
-        printf("temp=%d.%02d C\r\n", t100 / 100, abs(t100 % 100));
+        int16_t t100 = (int16_t)(d[0] | (d[1] << 8));
+        printf("   -> temperature %d.%02d C status=%u\r\n", t100 / 100, abs(t100 % 100), d[2]);
       }
+      else if (type == CAN_MSG_HB && h.DLC >= 6)
+        printf("   -> heartbeat state=%u flags=0x%02X uptime=%lu s\r\n", d[0], d[1],
+               (uint32_t)(d[2] | (d[3] << 8) | (d[4] << 16) | ((uint32_t)d[5] << 24)));
       else
-      {
-        printf("temp=n/a (%s)\r\n", t.status == 1 ? "sensor not found" : "read error");
-      }
+        printf("\r\n");
     }
+    osDelay(10);
   }
   /* USER CODE END StartUartTask */
 }
@@ -376,7 +476,9 @@ void StartSensorTask(void *argument)
   mpu_write(0x6A, 0x10);     /* USER_CTRL: SPI only */
   mpu_write(0x6B, 0x01);     /* PWR_MGMT_1: awake, best clock source */
   mpu_write(0x1C, 0x00);     /* ACCEL_CONFIG: +-2 g */
-  printf("MPU WHO_AM_I = 0x%02X\r\n", mpu_read(0x75));
+  uint8_t who = mpu_read(0x75);
+  printf("MPU WHO_AM_I = 0x%02X\r\n", who);
+  if (who != 0x70 && who != 0x71 && who != 0x73) set_err(ERR_IMU);   /* sensor missing or wrong */
 
   uint32_t next = osKernelGetTickCount();
   for(;;)
@@ -436,7 +538,7 @@ void StartProcessTask(void *argument)
     f.rms_mg  = (uint16_t)(sqrtf(sum2 / VIB_WINDOW) * 1000.0f / RAW_PER_G);
     f.peak_mg = (uint16_t)(peak * 1000.0f / RAW_PER_G);
     f.tick    = s.tick;
-    osMessageQueuePut(featureQueueHandle, &f, 0, 0);
+    if (osMessageQueuePut(featureQueueHandle, &f, 0, 0) != osOK) set_err(ERR_QUEUE_FULL);
 
     n = 0;                                          /* start the next window */
   }
@@ -460,12 +562,62 @@ void StartTempTask(void *argument)
     if (st == 0) g_temp.temp_c = t;
     osMutexRelease(tempMutexHandle);
 
+    if (st == 2) set_err(ERR_TEMP); else clear_err(ERR_TEMP);   /* "not found" is not an error */
+
     osDelay(st == 0 ? 250 : 1000);                  /* about one reading per second */
   }
   /* USER CODE END StartTempTask */
+}
+
+/* USER CODE BEGIN Header_StartCanTask */
+/* Sends the node data on CAN1 every second: vibration, temperature, heartbeat */
+/* USER CODE END Header_StartCanTask */
+void StartCanTask(void *argument)
+{
+  /* USER CODE BEGIN StartCanTask */
+  can_start();
+  uint8_t counter = 0;
+
+  for(;;)
+  {
+    uint8_t d[8];
+    VibFeature_t f;
+
+    /* 1) vibration: one result per second from ProcessTask */
+    if (osMessageQueueGet(featureQueueHandle, &f, NULL, 1100) == osOK)
+    {
+      put_u16(&d[0], f.rms_mg);
+      put_u16(&d[2], f.peak_mg);
+      d[4] = counter++;                       /* lets the gateway detect lost frames */
+      can_send(CAN_ID(CAN_MSG_VIB), d, 5);
+    }
+    else
+    {
+      set_err(ERR_IMU);                       /* no vibration data for more than 1 s */
+    }
+
+    /* 2) temperature: latest value from TempTask */
+    TempData_t t;
+    osMutexAcquire(tempMutexHandle, osWaitForever);
+    t = g_temp;
+    osMutexRelease(tempMutexHandle);
+    put_u16(&d[0], (uint16_t)(int16_t)(t.temp_c * 100.0f));   /* 0.01 degC units */
+    d[2] = t.status;
+    can_send(CAN_ID(CAN_MSG_TEMP), d, 3);
+
+    /* 3) heartbeat: node state, error flags, uptime */
+    uint8_t flags = g_err_flags;
+    d[0] = (flags == 0) ? 1 : 2;              /* 1 = running, 2 = error */
+    d[1] = flags;
+    put_u32(&d[2], osKernelGetTickCount() / 1000);
+    can_send(CAN_ID(CAN_MSG_HB), d, 6);
+    clear_err(ERR_QUEUE_FULL | ERR_CAN_TX);   /* reported once, then cleared */
+  }
+  /* USER CODE END StartCanTask */
 }
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
 
 /* USER CODE END Application */
+
