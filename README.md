@@ -4,7 +4,6 @@
 
 Two STM32 nodes measure the vibration and temperature of two DC motors and send them over a CAN bus to a Linux gateway. The gateway decodes and stores the data, runs a machine-learning model that detects abnormal motor behaviour, and shows measurements and alerts on a dashboard.
 
-> Status: 🚧 in progress — 30-day build, started November 2026.
 
 ## Architecture
 
