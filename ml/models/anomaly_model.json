@@ -1,0 +1,15 @@
+{
+  "features": [
+    "rms_mean",
+    "rms_std",
+    "peak_max",
+    "crest",
+    "temp",
+    "temp_slope"
+  ],
+  "threshold": 0.6041404184055185,
+  "alarm_after": 3,
+  "vib_window_s": 10.0,
+  "temp_window_s": 60.0,
+  "train_samples": 1136
+}
