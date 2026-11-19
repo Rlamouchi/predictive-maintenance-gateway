@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Motor Monitoring</title>
+<script src="/static/chart.umd.min.js"></script>
+<style>
+  :root { --bg:#0f1720; --card:#17212c; --text:#e6edf3; --muted:#8b98a5;
+          --ok:#2ea043; --warn:#d29922; --err:#f85149; --m1:#4c9be8; --m2:#e8834c; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:16px 24px; border-bottom:1px solid #243140; display:flex; justify-content:space-between; align-items:center; }
+  h1 { font-size:20px; margin:0; } .muted { color:var(--muted); font-size:13px; }
+  main { padding:20px 24px; display:grid; gap:16px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .card { background:var(--card); border-radius:10px; padding:16px; }
+  .wide { grid-column: 1 / -1; }
+  .node-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+  .badge { padding:3px 10px; border-radius:20px; font-size:12px; font-weight:600; }
+  .on { background:rgba(46,160,67,.2); color:var(--ok); } .off { background:rgba(248,81,73,.2); color:var(--err); }
+  .kpis { display:flex; gap:24px; margin:8px 0 12px; }
+  .kpi b { display:block; font-size:24px; } .kpi span { color:var(--muted); font-size:12px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  td, th { text-align:left; padding:6px 8px; border-bottom:1px solid #243140; }
+  .sev-error { color:var(--err); } .sev-warning { color:var(--warn); } .sev-info { color:var(--muted); }
+  canvas { max-height:240px; }
+  .ai-ok { background:rgba(46,160,67,.2); color:var(--ok); } .ai-alarm { background:rgba(248,81,73,.25); color:var(--err); }
+  .ai-none { background:#243140; color:var(--muted); }
+  .alarm-card { outline:2px solid var(--err); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Predictive Maintenance Gateway</h1>
+  <span class="muted" id="updated">waiting for data…</span>
+</header>
+<main>
+  <section class="card" id="node1"></section>
+  <section class="card" id="node2"></section>
+  <section class="card wide">
+    <div class="node-head"><b>Vibration RMS (mg), last 2 minutes</b></div>
+    <canvas id="chart"></canvas>
+  </section>
+  <section class="card wide">
+    <div class="node-head"><b>AI anomaly score (higher = more abnormal)</b>
+      <span class="muted" id="thr"></span></div>
+    <canvas id="aichart"></canvas>
+  </section>
+  <section class="card wide">
+    <b>Diagnostic events</b>
+    <table><thead><tr><th>Time</th><th>Node</th><th>Severity</th><th>Event</th><th>Detail</th></tr></thead>
+    <tbody id="events"></tbody></table>
+  </section>
+</main>
+<script>
+const chart = new Chart(document.getElementById('chart'), {
+  type: 'line',
+  data: { datasets: [
+    { label: 'Motor 1', data: [], borderColor: '#4c9be8', pointRadius: 0, borderWidth: 2 },
+    { label: 'Motor 2', data: [], borderColor: '#e8834c', pointRadius: 0, borderWidth: 2 } ] },
+  options: { animation: false, parsing: false, responsive: true,
+    scales: { x: { type: 'linear', ticks: { color: '#8b98a5',
+                 callback: v => new Date(v * 1000).toLocaleTimeString() } },
+              y: { beginAtZero: true, ticks: { color: '#8b98a5' }, grid: { color: '#243140' } } },
+    plugins: { legend: { labels: { color: '#e6edf3' } } } }
+});
+
+const aichart = new Chart(document.getElementById('aichart'), {
+  type: 'line',
+  data: { datasets: [
+    { label: 'Motor 1', data: [], borderColor: '#4c9be8', pointRadius: 0, borderWidth: 2 },
+    { label: 'Motor 2', data: [], borderColor: '#e8834c', pointRadius: 0, borderWidth: 2 },
+    { label: 'Threshold', data: [], borderColor: '#f85149', borderDash: [6, 4], pointRadius: 0, borderWidth: 1.5 } ] },
+  options: { animation: false, parsing: false, responsive: true,
+    scales: { x: { type: 'linear', ticks: { color: '#8b98a5',
+                 callback: v => new Date(v * 1000).toLocaleTimeString() } },
+              y: { ticks: { color: '#8b98a5' }, grid: { color: '#243140' } } },
+    plugins: { legend: { labels: { color: '#e6edf3' } } } }
+});
+
+function aiBadge(n) {
+  if (!n.anomaly.length) return '<span class="badge ai-none">AI: no model</span>';
+  return n.alarm ? '<span class="badge ai-alarm">AI: ANOMALY</span>'
+                 : '<span class="badge ai-ok">AI: normal</span>';
+}
+
+function nodeCard(id, n) {
+  const last = n.vibration.length ? n.vibration[n.vibration.length - 1] : null;
+  return `<div class="node-head"><b>Motor ${id}</b>
+      <span>${aiBadge(n)} <span class="badge ${n.online ? 'on' : 'off'}">${n.online ? 'ONLINE' : 'OFFLINE'}</span></span></div>
+    <div class="kpis">
+      <div class="kpi"><b>${last ? last.rms : '–'}</b><span>vibration RMS (mg)</span></div>
+      <div class="kpi"><b>${last ? last.peak : '–'}</b><span>peak (mg)</span></div>
+      <div class="kpi"><b>${n.temp_c !== null ? n.temp_c.toFixed(1) : '–'}</b><span>temperature (°C)</span></div>
+    </div>
+    <span class="muted">uptime ${n.uptime_s ?? '–'} s · error flags ${n.flags ?? '–'}</span>`;
+}
+
+async function refresh() {
+  try {
+    const s = await (await fetch('/api/state?window=120')).json();
+    for (const id of [1, 2]) {
+      const el = document.getElementById('node' + id);
+      el.innerHTML = nodeCard(id, s.nodes[id]);
+      el.classList.toggle('alarm-card', s.nodes[id].alarm);
+      aichart.data.datasets[id - 1].data = s.nodes[id].anomaly.map(p => ({ x: p.t, y: p.score }));
+      chart.data.datasets[id - 1].data = s.nodes[id].vibration.map(p => ({ x: p.t, y: p.rms }));
+    }
+    chart.update();
+    const xs = [1, 2].flatMap(i => s.nodes[i].anomaly.map(p => p.t));
+    aichart.data.datasets[2].data = (s.threshold && xs.length)
+      ? [{ x: Math.min(...xs), y: s.threshold }, { x: Math.max(...xs), y: s.threshold }] : [];
+    aichart.update();
+    document.getElementById('thr').textContent = s.threshold ? 'threshold ' + s.threshold.toFixed(3) : 'no trained model';
+    document.getElementById('events').innerHTML = s.events.map(e =>
+      `<tr><td>${new Date(e.ts * 1000).toLocaleTimeString()}</td><td>${e.node ?? '–'}</td>
+       <td class="sev-${e.severity}">${e.severity}</td><td>${e.type}</td><td>${e.detail ?? ''}</td></tr>`).join('');
+    document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+  } catch (err) {
+    document.getElementById('updated').textContent = 'no connection to the gateway database';
+  }
+}
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
